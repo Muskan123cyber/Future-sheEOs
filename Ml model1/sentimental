@@ -1,0 +1,271 @@
+import os
+import torch
+import torchaudio
+import torchaudio.transforms as T
+import numpy as np
+import torchcrepe
+from pyannote.audio import Pipeline
+from transformers import pipeline as tf_pipeline
+from gliner import GLiNER
+
+# -----------------------------
+# CONFIGURATION & GLOBAL MODELS
+# -----------------------------
+# 🔴 IMPORTANT: Put your HuggingFace Token here!
+HF_TOKEN = "YOUR_HUGGINGFACE_TOKEN" 
+
+# Detect Hardware
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Initializing on {device}...")
+
+# 1. LOAD WHISPER (ASR)
+# We use Transformers pipeline instead of faster_whisper for better integration
+print("Loading Whisper...")
+asr_pipe = tf_pipeline(
+    "automatic-speech-recognition", 
+    model="openai/whisper-medium", 
+    device=0 if device=="cuda" else -1,
+    return_timestamps=True
+)
+
+# 2. LOAD ROBERTA (Advanced Emotion)
+print("Loading RoBERTa...")
+emotion_pipe = tf_pipeline(
+    "text-classification", 
+    model="SamLowe/roberta-base-go_emotions", 
+    top_k=None, # Return all scores
+    device=0 if device=="cuda" else -1
+)
+
+# 3. LOAD GLINER (Financial Entities)
+print("Loading GLiNER...")
+entity_model = GLiNER.from_pretrained("urchade/gliner_medium-v2.1").to(device)
+
+# 4. LOAD DIARIZATION (Speaker Splits)
+print("Loading Diarization...")
+diarization_pipeline = Pipeline.from_pretrained(
+    "pyannote/speaker-diarization-3.1", 
+    use_auth_token=HF_TOKEN
+).to(torch.device(device))
+
+
+# -----------------------------
+# AUDIO UTILS (NO LIBROSA)
+# -----------------------------
+def load_audio_torch(audio_path, target_sr=16000):
+    """
+    Loads audio using purely PyTorch (GPU compatible).
+    """
+    waveform, sr = torchaudio.load(audio_path)
+    
+    # Convert Stereo to Mono
+    if waveform.shape[0] > 1:
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+    # Resample to 16kHz
+    if sr != target_sr:
+        resampler = T.Resample(sr, target_sr).to(waveform.device)
+        waveform = resampler(waveform)
+        
+    return waveform.to(device), target_sr
+
+def analyze_physics(waveform, sr, start, end):
+    """
+    Calculates Pitch and Energy using PyTorch (No Librosa).
+    """
+    start_sample = int(start * sr)
+    end_sample = int(end * sr)
+    
+    # Slice tensor directly
+    audio_slice = waveform[:, start_sample:end_sample]
+    
+    # Skip if segment is too short (< 0.1s)
+    if audio_slice.shape[1] < 1600: return 0, 0, 0
+
+    # 1. Energy (Loudness) calculation
+    # RMS = Sqrt(Mean(Square(Signal)))
+    energy = torch.sqrt(torch.mean(audio_slice**2)).item()
+    
+    # 2. Pitch (CREPE)
+    # Move slice to GPU for CREPE
+    audio_slice_gpu = audio_slice.to(device)
+    
+    try:
+        f0, confidence = torchcrepe.predict(
+            audio_slice_gpu, 
+            sr, 
+            hop_length=160, 
+            fmin=50, 
+            fmax=400, 
+            model='tiny', 
+            decoder=torchcrepe.decode.viterbi, 
+            device=device,
+            batch_size=2048
+        )
+        
+        # Filter low confidence (noise)
+        f0 = f0[0].detach().cpu().numpy()
+        conf = confidence[0].detach().cpu().numpy()
+        f0[conf < 0.6] = np.nan
+        
+        avg_pitch = np.nanmean(f0)
+        pitch_var = np.nanstd(f0)
+        
+        # Handle cases where no pitch was found (all NaN)
+        if np.isnan(avg_pitch): avg_pitch = 0
+        if np.isnan(pitch_var): pitch_var = 0
+            
+        return avg_pitch, pitch_var, energy
+
+    except Exception as e:
+        # Fallback if CREPE fails on silence
+        return 0, 0, energy
+
+
+# -----------------------------
+# CORE LOGIC: MULTIMODAL FUSION
+# -----------------------------
+def calculate_multimodal_risk(text_emotions, avg_pitch, pitch_var, energy):
+    """
+    The Brain: Combines RoBERTa (Text) + Torch (Audio) to find Risk.
+    """
+    risk_score = 0
+    reasons = []
+
+    # 1. TEXT RISK (RoBERTa)
+    # text_emotions is list of dicts: [{'label': 'joy', 'score': 0.9}, ...]
+    emotions_dict = {e['label']: e['score'] for e in text_emotions[0]}
+    primary_emotion = max(emotions_dict, key=emotions_dict.get)
+    
+    high_risk = ['anger', 'annoyance', 'disapproval', 'disgust', 'fear']
+    medium_risk = ['confusion', 'remorse', 'sadness', 'nervousness']
+    
+    if primary_emotion in high_risk:
+        risk_score += 40
+        reasons.append(f"Text Emotion: {primary_emotion.upper()}")
+    elif primary_emotion in medium_risk:
+        risk_score += 20
+        reasons.append(f"Text Emotion: {primary_emotion}")
+
+    # 2. AUDIO RISK (Physics)
+    # Thresholds: Pitch > 250Hz (Stress), Energy > 0.1 (Loud)
+    if avg_pitch > 250:
+        risk_score += 15
+        reasons.append("Audio: High Pitch (Stress)")
+    
+    if energy > 0.1: 
+        risk_score += 15
+        reasons.append("Audio: High Volume (Shouting)")
+        
+    if pitch_var > 40:
+        risk_score += 10
+        reasons.append("Audio: Voice Trembling")
+
+    # 3. INCONGRUENCE (SARCASM)
+    # Positive Text + Aggressive Audio = Sarcasm
+    positive_emotions = ['joy', 'admiration', 'approval', 'gratitude']
+    
+    if primary_emotion in positive_emotions:
+        if energy > 0.15 or avg_pitch > 300:
+            risk_score += 40
+            reasons.append("⚠️ RISK: Sarcasm Detected (Polite Text + Aggressive Tone)")
+            primary_emotion = "Sarcasm (Inferred)"
+
+    return min(risk_score, 100), reasons, primary_emotion
+
+
+# -----------------------------
+# MAIN PIPELINE
+# -----------------------------
+def process_audio_file(audio_path: str):
+    print(f"\nProcessing: {audio_path}")
+    
+    try:
+        # Step 1: Load Audio (Torch)
+        waveform, sr = load_audio_torch(audio_path)
+        
+        # Step 2: Diarize (Find Segments)
+        print("--- Step 2: Diarizing Speakers ---")
+        diarization = diarization_pipeline(audio_path)
+        
+        results_list = []
+        
+        # Step 3: Process Each Speaker Segment
+        print("--- Step 3: Analyzing Segments ---")
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            start, end = turn.start, turn.end
+            duration = end - start
+            
+            if duration < 1.0: continue # Skip very short blips
+            
+            # A. Extract Physics for this specific segment
+            avg_pitch, pitch_var, energy = analyze_physics(waveform, sr, start, end)
+            
+            # B. Transcribe this specific segment
+            # (In production, we would transcribe whole file and align, 
+            # but for simplicity, we pass specific times to Whisper here? 
+            # Actually, standard Whisper pipeline takes whole file. 
+            # We will use the 'chunking' strategy or just transcribe the crop.)
+            
+            # Crop audio for ASR
+            start_sample = int(start * sr)
+            end_sample = int(end * sr)
+            audio_crop = waveform[0, start_sample:end_sample].cpu().numpy()
+            
+            # Whisper expects raw numpy
+            asr_out = asr_pipe(audio_crop)
+            text = asr_out['text'].strip()
+            
+            if not text: continue
+
+            # C. RoBERTa Sentiment
+            # Truncate to 512 tokens
+            roberta_out = emotion_pipe(text[:512])
+            
+            # D. Fusion Logic
+            risk, reasons, emotion = calculate_multimodal_risk(
+                roberta_out, avg_pitch, pitch_var, energy
+            )
+            
+            # E. Entity Extraction (Financial)
+            labels = ["loan", "amount", "date", "risk", "fraud"]
+            entities = entity_model.predict_entities(text, labels)
+            
+            segment_result = {
+                "start": round(start, 2),
+                "end": round(end, 2),
+                "speaker": speaker,
+                "text": text,
+                "emotion": emotion,
+                "risk_score": risk,
+                "risk_reasons": reasons,
+                "entities": [e['text'] for e in entities],
+                "physics": {
+                    "pitch": round(avg_pitch, 1),
+                    "energy": round(energy, 3)
+                }
+            }
+            results_list.append(segment_result)
+            
+            print(f"[{speaker}] {text[:30]}... (Risk: {risk} - {emotion})")
+
+        return {"status": "success", "segments": results_list}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# -----------------------------
+# ENTRY POINT
+# -----------------------------
+if __name__ == "__main__":
+    # Create dummy audio if none exists for testing
+    test_file = "test_audio.wav"
+    if not os.path.exists(test_file):
+        print("⚠️ No audio found. Please place 'test_audio.wav' in this folder.")
+    else:
+        final_output = process_audio_file(test_file)
+        
+        import pprint
+        print("\n--- FINAL JSON OUTPUT ---")
+        pprint.pprint(final_output)
